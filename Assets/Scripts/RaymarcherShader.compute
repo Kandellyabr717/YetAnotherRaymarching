@@ -1,0 +1,358 @@
+#pragma kernel CSMain
+
+struct CameraData
+{
+	float4x4 ToWorld;
+	float4x4 InverseProjection;
+	float3 ProjectionNormal;
+	float2 Resolution;
+};
+
+struct Object
+{
+    
+    int Shape;
+	int Operation;
+	float3 Position;
+	float3 Rotation;
+	float3 Scale;
+	int ChildCount;
+	float4 Color;
+	float Smoothness;
+	float BlendStrength;
+};
+
+struct ObjectsArray
+{
+	StructuredBuffer<Object> _Buffer;
+	int Count;
+};
+
+struct Ray
+{
+	float3 Origin;
+	float3 Direction;
+	float3 End;
+	float Length;
+	bool Hit;
+	float ClosestObjectDistance;
+	Object ClosestObject;
+};
+
+float4x4 CameraToWorld;
+float4x4 CameraInverseProjection;
+float2 CameraResolution;
+float3 CameraProjectionNormal;
+float3 LightDirection;
+StructuredBuffer<Object> ObjectsBuffer;
+int ObjectsCount;
+
+Texture2D<float4> Source;
+Texture2D<float4> Depth;
+RWTexture2D<float4> Frame;
+
+static bool AntiAliasing = true;
+static float2 Offsets[4] =
+{
+	float2(0.125, 0.375), 
+	float2(0.375, -0.125), 
+	float2(-0.125, -0.375), 
+	float2(-0.375, 0.125)
+};
+static float MaxRayLength = 100;
+static int MaxRaySteps = 100; 
+static float Epsilon = 0.0001;
+
+
+float SphereDistance(float3 _point, float3 centre, float radius)
+{
+	return distance(_point, centre) - radius / 2;
+}
+float CubeDistance(float3 _point, float3 centre, float3 scale)
+{
+    float3 o = abs(_point - centre) - scale / 2;
+    float ud = length(max(o, 0));
+    float n = max(max(min(o.x, 0),min(o.y, 0)), min(o.z, 0));
+    return ud + n;
+}
+float TorusDistance(float3 _point, float3 centre, float3 scale)
+{   
+    float2 q = float2(length((_point - centre).xz) - scale.x, _point.y - centre.y);
+    return length(q) - scale.y;
+}
+float PrismDistance(float3 _point, float3 centre, float3 scale)
+{
+    float3 q = abs(_point - centre);
+    return max(q.z - scale.y, max(q.x * 0.866025 + _point.y * 0.5, -_point.y) -scale.x * 0.5);
+}
+
+
+float4 ColorCorrection(float4 color)
+{
+	float4 med = (color.r + color.g + color.b) / 3;
+    color += med * 0.1;
+    color = pow(abs(color), 0.6);
+	return color;
+}
+
+
+float ObjectDistance(float3 _point, Object object)
+{
+	if (object.Shape == 0)
+	{
+		return SphereDistance(_point, object.Position, object.Scale.x);
+	}
+	if (object.Shape == 1)
+	{
+		return CubeDistance(_point, object.Position, object.Scale);
+	}
+	if (object.Shape == 2)
+	{
+		return TorusDistance(_point, object.Position, object.Scale);
+	}
+	if (object.Shape == 3)
+	{
+		return PrismDistance(_point, object.Position, object.Scale);
+	}
+	return 0;
+}
+float CombineDistance(float firstDistance, float secondDistance, Object first, Object second, out Object combined)
+{
+	combined = first;
+	float combinedDistance = firstDistance;
+	if (second.Operation == 0)
+	{
+		if(min(firstDistance, secondDistance) == secondDistance)
+		{
+			combined = second;
+			combinedDistance = secondDistance;
+		}
+	}
+	if (second.Operation == 1)
+	{
+		if(max(firstDistance, -secondDistance) == -secondDistance)
+		{
+			combined = second;
+			combinedDistance = -secondDistance;
+		}
+	}
+	if (second.Operation == 2)
+	{
+		if (max(firstDistance, secondDistance) == secondDistance)
+		{
+			combined = second;
+			combinedDistance = secondDistance;
+		}
+	}
+	if (second.Operation == 3)
+	{
+		float h = clamp(0.5 +0.5 * (secondDistance - firstDistance) / 1, 0, 1);
+		combined = second;
+		combined.Color = lerp(second.Color, first.Color, h);
+		combinedDistance = lerp(secondDistance, firstDistance, h) - 1 * h * (1 - h);
+	}
+	return combinedDistance;
+}
+float ClosestObjectDistance(float3 _point, ObjectsArray objects, out Object closest)
+{
+    float closestDistance = MaxRayLength;
+    for (int i = 0; i < objects.Count; i++)
+    {
+		Object parent = objects._Buffer[i];
+		Object local = parent;
+        float localDistance = ObjectDistance(_point, parent);
+		for (int j = 0; j < parent.ChildCount; j++)
+		{
+			Object child = objects._Buffer[i + j + 1];
+			float childDistance = ObjectDistance(_point, child);
+			localDistance = CombineDistance(localDistance, childDistance, local, child, local);
+		}
+        i += parent.ChildCount;
+		local.Operation = 0;
+		closestDistance = CombineDistance(closestDistance, localDistance, closest, local, closest);
+    }
+    return closestDistance;
+}
+float ClosestObjectDistance(float3 _point, ObjectsArray objects)
+{
+	Object temp;
+	return ClosestObjectDistance(_point, objects, temp);
+}
+
+
+ObjectsArray CreateObjects(StructuredBuffer<Object> buffer, int count)
+{
+	ObjectsArray objects;
+    objects._Buffer = buffer;
+    objects.Count = count;
+	return objects;
+}
+CameraData CreateCamera(float4x4 toWorld, float4x4 inverseProjection, float3 projectionNormal, float2 resolution)
+{
+	CameraData camera;
+    camera.ToWorld = toWorld;
+    camera.InverseProjection = inverseProjection;
+	camera.ProjectionNormal = projectionNormal;
+    camera.Resolution = resolution;
+	return camera;
+}
+Ray CreateRay(uint3 id, CameraData camera, float2 offset)
+{
+    Ray ray;
+    ray.Origin = mul(camera.ToWorld, float4(0, 0, 0, 1)).xyz;
+	float2 uv = (id.xy + offset) / camera.Resolution * 2 - 1;
+    ray.Direction = mul(camera.InverseProjection, float4(uv, 0, 1)).xyz;
+    ray.Direction = normalize(mul(camera.ToWorld, float4(ray.Direction, 0)).xyz);
+	return ray;
+}
+
+
+float3 GetNormal(float3 _point, float closestObjectDistance, ObjectsArray objects)
+{
+	float2 e = float2(Epsilon, 0);
+	float3 o = closestObjectDistance;
+	float a = ClosestObjectDistance(_point - e.xyy, objects);
+	float b = ClosestObjectDistance(_point - e.yxy, objects);
+	float c = ClosestObjectDistance(_point - e.yyx, objects);
+	float3 normal = o - float3(a, b, c);
+	return normalize(normal);
+}
+
+
+float GetLinearDistance(Ray ray, CameraData camera)
+{
+	float flatDistance = dot(camera.ProjectionNormal.xyz, ray.Direction)
+							* ray.Length;
+    float linearDistance = 1 / (pow(abs(flatDistance), 1) * 13.15) - (1 / (flatDistance) * Epsilon);
+	return linearDistance;
+}
+void TraceRay(inout Ray ray, ObjectsArray objects)
+{
+	while (ray.Length < MaxRayLength)
+    {
+		ray.End = ray.Origin + ray.Direction * ray.Length;
+        ray.ClosestObjectDistance = ClosestObjectDistance(ray.End, objects, ray.ClosestObject);
+		ray.Length += ray.ClosestObjectDistance;
+        if (ray.ClosestObjectDistance < Epsilon)
+        {
+            ray.Hit = true;
+			return;
+        }
+    }
+}
+void TraceRay(inout Ray ray, ObjectsArray objects, uint3 id, CameraData camera, Texture2D<float4> depth)
+{
+	TraceRay(ray, objects);
+	if (GetLinearDistance(ray, camera) < depth[id.xy].x)
+	{
+		ray.Hit = false;
+	}
+}
+
+bool IsPixelInOuterShadow(Ray ray, float3 normal, float3 lightDirection, ObjectsArray objects)
+{
+	Ray lightRay;
+	lightRay.Origin = ray.End + ray.Direction * ray.ClosestObjectDistance + normal * Epsilon * 50;
+	lightRay.Direction = normalize(-lightDirection);
+	TraceRay(lightRay, objects);
+	return lightRay.Hit && dot(normal, lightRay.Direction) >= 0;
+}
+float4 GetPixelAmbient(Ray ray, float3 normal,  float3 lightDirection)
+{
+	float3 lightNormal = normalize(-lightDirection - normalize(ray.Origin) / 10);
+	float4 ambient = dot(normal, lightNormal);
+	return clamp((ambient + 1) * 0.2 + 0.2, 0.2, 0.4);
+}
+float4 GetPixelDiffuse(Ray ray, float3 normal, float3 lightDirection)
+{
+	float3 lightNormal = normalize(-lightDirection - normalize(ray.Origin) / 10);
+	float4 diffuse = dot(normal, lightNormal);
+	if (diffuse.x >= 0)
+	{
+		return clamp(diffuse * 0.6 + 0.4, 0.4, 1);
+	}
+	else
+	{
+		return GetPixelAmbient(ray, normal, lightDirection);
+	}
+}
+float4 GetPixelSpecular(Ray ray, float3 normal, float3 lightDirection)
+{
+	float3 lightNormal = normalize(lightDirection);
+	float3 reflected = reflect(lightNormal, normal);
+	float specular = dot(reflected, -ray.Direction) * ray.ClosestObject.Smoothness;
+	return pow(clamp(specular, 0, 1), pow(2, ray.ClosestObject.Smoothness));
+}
+float4 GetPixelColor(Ray ray, float3 lightDirection, ObjectsArray objects, uint3 id, Texture2D<float4> source)
+{
+	if (!ray.Hit)
+	{
+        return source[id.xy];
+    }
+	else
+	{
+		float4 color = ColorCorrection(ray.ClosestObject.Color);
+		float3 normal = GetNormal(ray.End, ray.ClosestObjectDistance, objects);
+		float4 diffuse = GetPixelDiffuse(ray, normal, lightDirection);
+		if (IsPixelInOuterShadow(ray, normal, lightDirection, objects))
+		{
+			float4 ambient = GetPixelAmbient(ray, normal, lightDirection);
+			return color * ambient;
+		}
+		else
+		{
+			float4 specular = GetPixelSpecular(ray, normal, lightDirection);
+			return color * diffuse + ((1 - color) * specular);
+		}
+	}
+}
+
+
+void CreateSamlerRays(out Ray rays[4], uint3 id, CameraData camera, float2 offsets[4])
+{
+	for(int i = 0; i < 4; i++)
+	{
+		rays[i] = CreateRay(id, camera, offsets[i]);
+	}
+}
+void TraceSamplerRays(inout Ray rays[4], uint3 id, CameraData camera, ObjectsArray objects, Texture2D<float4> depth)
+{
+	for(int i = 0; i < 4; i++)
+	{
+		TraceRay(rays[i], objects, id, camera, Depth);
+	}
+}
+float4 GetSampledPixelColor(Ray rays[4], uint3 id, float3 lightDirection, ObjectsArray objects, Texture2D<float4> source)
+{
+	float4 color = 0;
+	for(int i = 0; i < 4; i++)
+	{
+		color += GetPixelColor(rays[i], lightDirection, objects, id, source);
+	}
+	return color / 4;
+}
+
+
+[numthreads(30,30,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	CameraData camera = CreateCamera(CameraToWorld, CameraInverseProjection, CameraProjectionNormal.xyz, CameraResolution.xy);
+	ObjectsArray objects = CreateObjects(ObjectsBuffer, ObjectsCount);
+
+	if (AntiAliasing)
+	{
+		Ray rays[4];
+		CreateSamlerRays(rays, id, camera, Offsets);
+		TraceSamplerRays(rays, id, camera, objects, Depth);
+		Frame[id.xy] = GetSampledPixelColor(rays, id, LightDirection.xyz, objects, Source);
+	}
+	else
+	{
+		Ray ray = CreateRay(id, camera, float2(0, 0));
+		TraceRay(ray, objects, id, camera, Depth);
+		Frame[id.xy] = GetPixelColor(ray, LightDirection.xyz, objects, id, Source);
+		//Frame[id.xy] = max(GetLinearDistance(ray, camera) , Depth[id.xy].x);
+		//float3 n = GetNormal(ray.End, ray.ClosestObjectDistance, objects);
+		//Frame[id.xy] = float4(n.x, n.y, n.z, 0);
+	}
+}
